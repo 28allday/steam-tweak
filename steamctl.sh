@@ -14,7 +14,10 @@
 # 3. Screen selection. Picks which display Game Mode opens on.
 #
 # 4. Lid handling. Stops the laptop sleeping when you leave Game Mode with the
-#    lid shut and an external monitor attached.
+#    lid shut and an external monitor attached. Two daemons handle the lid
+#    depending on which session is up, so both get set, for both power states.
+#    Note the consequence: a closed lid then never sleeps this machine at all,
+#    bag included.
 #
 # Usage:
 #   ./steamctl.sh              interactive menu (boot mode + GPU picker)
@@ -29,9 +32,9 @@
 #   ./steamctl.sh screen       pick which display Steam/Game Mode opens on
 #   ./steamctl.sh screen status  show the pinned screen
 #   ./steamctl.sh screen reset   unpin, back to stock
-#   ./steamctl.sh lid awake    on AC, don't sleep when the lid closes
+#   ./steamctl.sh lid awake    never sleep on lid close (AC and battery)
 #   ./steamctl.sh lid suspend  restore stock lid behaviour
-#   ./steamctl.sh lid status   show what logind will do on lid close
+#   ./steamctl.sh lid status   show what will actually happen on lid close
 #   ./steamctl.sh diag mark    timestamp a baseline before testing Game Mode
 #   ./steamctl.sh diag         report suspends/crashes since that baseline
 #   ./steamctl.sh status       report current state, change nothing
@@ -91,16 +94,49 @@ readonly WRAPPER_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/steamctl/bin"
 readonly WRAPPER="${WRAPPER_DIR}/gamescope"
 readonly SCREEN_DROPIN="${GPU_DROPIN_DIR}/20-steamctl-screen.conf"
 
-# Lid behaviour. Leaving Game Mode with the lid shut puts the laptop to sleep:
-# gamescope segfaults during teardown, which tears down the DRM outputs, so for
-# a moment logind sees no external display, stops treating the machine as
-# docked, and falls back to HandleLidSwitch=suspend.
+# Lid behaviour. Leaving Game Mode with the lid shut puts the laptop to sleep.
 #
-# HandleLidSwitchDocked is already `ignore`, but it cannot help — it depends on
-# display detection, which is exactly what breaks. HandleLidSwitchExternalPower
-# keys off AC power instead, so it holds through the glitch. On battery the lid
-# still suspends, which is what you want in a bag.
+# Traced from the journal, the sequence is not what it looks like: the suspend
+# is requested *before* gamescope's teardown segfault, and no lid-switch event
+# is logged at all. The lid was already shut; what changes is ownership. Game
+# Mode means no Plasma session, so PowerDevil's inhibitor (see below) is gone,
+# and when the gamescope session's own inhibitors drop on exit logind
+# re-evaluates the lid, finds it closed, and applies its policy right there.
+#
+# HandleLidSwitchDocked is already `ignore` and cannot help: it depends on
+# display detection, which the teardown breaks. So both of the remaining
+# settings are pinned — HandleLidSwitchExternalPower for AC, HandleLidSwitch
+# for battery.
+#
+# Covering battery is a deliberate choice, not an oversight: a closed lid now
+# never sleeps this machine, including in a bag, where it will stay awake and
+# get warm. PowerDevil's separate critical-battery action is untouched and
+# still fires, which is the one remaining backstop.
 readonly LID_DROPIN="/etc/systemd/logind.conf.d/10-steamctl-lid.conf"
+
+# ...but logind is only half of it, and on its own it does nothing in Desktop
+# Mode. KDE's PowerDevil takes a *block*-mode inhibitor on handle-lid-switch
+# ("KDE handles power events"), and a block inhibitor stops logind acting on the
+# lid at all. So while Plasma is running, HandleLidSwitchExternalPower is inert
+# and PowerDevil decides — which it does with its own docked check, defeated by
+# the very same momentary loss of the display. Setting only the logind half
+# looks like it worked (logind cheerfully reports "ignore") while the laptop
+# carries on suspending.
+#
+# The matching PowerDevil setting is LidAction. Both the nested-group layout
+# and the encoding are taken from SteamOS's own /etc/xdg/powerdevilrc, which
+# ships PowerButtonAction=1 for "sleep" and AutoSuspendAction=0 for "do
+# nothing" — so 0 is the do-nothing action.
+#
+# All three profiles are set, matching the logind half. Leaving LowBattery out
+# would mean the lid quietly starts sleeping the machine again once the battery
+# runs down, which is exactly the kind of it-worked-yesterday behaviour this
+# script exists to avoid.
+readonly PD_FILE="powerdevilrc"
+readonly -a PD_PROFILES=(AC Battery LowBattery)
+readonly PD_GROUP="SuspendAndShutdown"
+readonly PD_KEY="LidAction"
+readonly PD_NO_ACTION="0"
 
 die() { printf '!! %s\n' "$*" >&2; exit 1; }
 info() { printf '   %s\n' "$*"; }
@@ -260,9 +296,9 @@ main_menu() {
     printf '\n=== SteamOS Laptop Manager ===\n\n'
     show_status
     if lid_awake_enabled; then
-      lid_label="Let lid-close sleep the machine again (currently: stays awake on AC)"
+      lid_label="Let lid-close sleep the machine again (currently: never sleeps)"
     else
-      lid_label="Stop lid-close sleeping the machine on AC (fixes black screen)"
+      lid_label="Stop lid-close sleeping the machine, ever (fixes black screen)"
     fi
 
     printf '\n  1) %s\n' "$lock_label"
@@ -358,34 +394,170 @@ run_diag() {
 
 # --------------------------------------------------------------- Lid handling
 
-lid_awake_enabled() { [[ -e "$LID_DROPIN" ]]; }
+pd_available() {
+  command -v kwriteconfig6 >/dev/null 2>&1 && command -v kreadconfig6 >/dev/null 2>&1
+}
+
+# Who, if anyone, has taken the lid switch away from logind. Only a block-mode
+# inhibitor does that; the delay-mode ones (NetworkManager, UPower) just want a
+# moment before sleep and leave the decision with logind.
+#
+# $NF is the MODE column: the WHY column contains spaces, so counting fields
+# from the left is unreliable while counting from the right is not.
+lid_inhibited_by() {
+  systemd-inhibit --list --no-pager 2>/dev/null \
+    | awk 'NF && $NF == "block" && /handle-lid-switch/ { print $1; exit }'
+}
+
+# Empty means no key anywhere, in which case PowerDevil applies its built-in
+# default — which is to sleep. kreadconfig6 reads the same merged view of
+# /etc/xdg + ~/.config that PowerDevil itself does.
+pd_lid_action() {
+  local profile="$1"
+  pd_available || return 0
+  kreadconfig6 --file "$PD_FILE" --group "$profile" --group "$PD_GROUP" \
+    --key "$PD_KEY" --default "" 2>/dev/null
+}
+
+pd_action_label() {
+  case "$1" in
+    0)  printf 'do nothing' ;;
+    1)  printf 'sleep' ;;
+    "") printf 'sleep (its default)' ;;
+    *)  printf 'action %s' "$1" ;;
+  esac
+}
+
+# Report the profiles as a set: they are only interesting when they disagree,
+# which is what a half-applied or hand-edited config looks like.
+pd_lid_label() {
+  local profile v prev="" same=1 seen=0 out=""
+  for profile in "${PD_PROFILES[@]}"; do
+    v="$(pd_lid_action "$profile")"
+    if (( seen )) && [[ "$v" != "$prev" ]]; then same=0; fi
+    prev="$v"; seen=1
+    out+="${profile}=$(pd_action_label "$v"), "
+  done
+  if (( same )); then
+    pd_action_label "$prev"
+  else
+    printf '%s' "${out%, }"
+  fi
+}
+
+# Every profile has to be set, or a battery-level change silently brings the
+# sleeping back.
+pd_lid_ok() {
+  local profile
+  for profile in "${PD_PROFILES[@]}"; do
+    [[ "$(pd_lid_action "$profile")" == "$PD_NO_ACTION" ]] || return 1
+  done
+  return 0
+}
+
+# Whether we have written anything at all, however partially.
+pd_lid_any_set() {
+  local profile
+  for profile in "${PD_PROFILES[@]}"; do
+    [[ -n "$(pd_lid_action "$profile")" ]] && return 0
+  done
+  return 1
+}
+
+# PowerDevil watches the file, but ask it to re-read anyway so the change
+# applies to the running session rather than only after the next login. This is
+# best-effort: from a TTY or from inside Game Mode there is no session bus to
+# talk to, and the on-disk setting still stands for the next Plasma start.
+pd_reload() {
+  qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement \
+    org.kde.Solid.PowerManagement.reparseConfiguration >/dev/null 2>&1 || true
+}
+
+# Both halves have to be in place. An install from before the PowerDevil half
+# existed therefore reads as off, so the menu offers to complete it rather than
+# showing a fix that does not actually hold.
+lid_awake_enabled() {
+  [[ -e "$LID_DROPIN" ]] || return 1
+  ! pd_available || pd_lid_ok
+}
 
 # Ask logind what it will actually do, rather than trusting that our file is
 # the last word — another drop-in could override it.
+logind_prop() {
+  busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager "$1" 2>/dev/null \
+    | sed -E 's/^s "?//; s/"?$//'
+}
+
+# On AC. An empty value means "inherit HandleLidSwitch".
 effective_lid_action() {
   local v
-  v="$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
-        org.freedesktop.login1.Manager HandleLidSwitchExternalPower 2>/dev/null \
-        | sed -E 's/^s "?//; s/"?$//')"
-  # An empty value means "inherit HandleLidSwitch".
+  v="$(logind_prop HandleLidSwitchExternalPower)"
   if [[ -z "$v" ]]; then
-    v="$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
-          org.freedesktop.login1.Manager HandleLidSwitch 2>/dev/null \
-          | sed -E 's/^s "?//; s/"?$//')"
+    v="$(logind_prop HandleLidSwitch)"
     v="${v:-unknown} (inherited)"
   fi
   printf '%s' "$v"
 }
 
-show_lid_status() {
-  local act
-  act="$(effective_lid_action)"
+# On battery. HandleLidSwitch is the plain fallback, with no inheriting to do.
+effective_lid_action_battery() {
+  local v
+  v="$(logind_prop HandleLidSwitch)"
+  printf '%s' "${v:-unknown}"
+}
 
-  if lid_awake_enabled; then
-    printf 'Lid on AC : %s — stays awake when you leave Game Mode\n' "$act"
+logind_lid_ok() {
+  [[ "$(effective_lid_action)" == "ignore" && "$(effective_lid_action_battery)" == "ignore" ]]
+}
+
+# Report whoever actually decides, not whichever setting is easiest to read.
+# Quoting logind's answer while PowerDevil holds the lid is what made the old
+# version claim success on a machine that kept suspending.
+show_lid_status() {
+  local ac bat owner on_ac
+  ac="$(effective_lid_action)"
+  bat="$(effective_lid_action_battery)"
+  owner="$(lid_inhibited_by)"
+  on_ac="$(on_ac_power && printf 'AC' || printf 'battery')"
+
+  if [[ "$owner" == PowerDevil* ]]; then
+    if pd_lid_ok; then
+      printf 'Lid close : stays awake — KDE PowerDevil owns the lid, set to "%s"\n' "$(pd_lid_label)"
+    else
+      printf 'Lid close : WILL SLEEP — KDE PowerDevil owns the lid, set to "%s"\n' "$(pd_lid_label)"
+      # An `x && y` as the last command in a function returns y's status, so
+      # under `set -e` a false test here would abort the whole script.
+      if logind_lid_ok; then
+        info "   (logind says 'ignore', but PowerDevil blocks handle-lid-switch, so that is inert)"
+      fi
+    fi
+  elif [[ -n "$owner" ]]; then
+    printf 'Lid close : %s has taken over the lid — logind (AC %s / battery %s) does not decide\n' \
+      "$owner" "$ac" "$bat"
+  elif logind_lid_ok; then
+    printf 'Lid close : stays awake — logind is set to ignore on AC and battery\n'
   else
-    printf 'Lid on AC : %s — closing the lid can sleep the machine\n' "$act"
+    printf 'Lid close : WILL SLEEP — logind: AC=%s, battery=%s\n' "$ac" "$bat"
   fi
+
+  # Game Mode runs with no Plasma session, so logind decides there regardless of
+  # what PowerDevil is configured to do. Say which half is load-bearing now.
+  printf 'Running on: %s (Game Mode always uses the logind setting)\n' "$on_ac"
+}
+
+# Mains online. Several supplies can exist (USB-C PD, barrel); any one online
+# counts, and a machine with no Mains supply at all reads as AC rather than
+# claiming a laptop is on battery it does not have.
+on_ac_power() {
+  local p found=0
+  for p in /sys/class/power_supply/*/; do
+    [[ -r "${p}type" && "$(cat "${p}type")" == "Mains" ]] || continue
+    found=1
+    [[ "$(cat "${p}online" 2>/dev/null)" == "1" ]] && return 0
+  done
+  (( found )) && return 1
+  return 0
 }
 
 set_lid_awake() {
@@ -393,38 +565,81 @@ set_lid_awake() {
   sudo mkdir -p "$(dirname "$LID_DROPIN")"
   sudo tee "$LID_DROPIN" >/dev/null <<'EOF'
 # Written by steamctl.sh.
-# Leaving Game Mode with the lid shut used to suspend the laptop: gamescope
-# crashes on teardown, logind briefly sees no external display, stops treating
-# the machine as docked, and applies HandleLidSwitch=suspend.
-# Keying off AC power instead survives that momentary loss of the display.
-# On battery the lid still suspends.
+# Leaving Game Mode with the lid shut used to suspend the laptop. Game Mode
+# means no Plasma session, so PowerDevil is not there to hold the lid; when the
+# gamescope session's inhibitors drop on exit, logind re-evaluates the lid,
+# finds it closed, and suspends. HandleLidSwitchDocked cannot help because it
+# depends on display detection, which the teardown breaks.
+#
+# Both power states are pinned, so a closed lid never sleeps this machine --
+# including in a bag. PowerDevil's critical-battery action still fires.
 [Login]
 HandleLidSwitchExternalPower=ignore
+HandleLidSwitch=ignore
 EOF
 
   # Reload rather than restart: restarting logind can tear down live sessions.
   sudo systemctl reload systemd-logind
 
-  local act
-  act="$(effective_lid_action)"
-  [[ "$act" == "ignore" ]] \
-    || die "logind still reports '$act' for lid-on-AC — setting did not apply."
+  logind_lid_ok \
+    || die "logind still reports AC=$(effective_lid_action), battery=$(effective_lid_action_battery) — setting did not apply."
 
-  printf '\nOK — on AC power, closing the lid no longer sleeps the machine.\n'
-  info "On battery it still suspends. Revert with: $0 lid suspend"
+  # Second half. Without this the fix does nothing at all in Desktop Mode.
+  if pd_available; then
+    local profile
+    info "Setting KDE PowerDevil's lid action to 'do nothing' (${PD_PROFILES[*]}) ..."
+    for profile in "${PD_PROFILES[@]}"; do
+      kwriteconfig6 --file "$PD_FILE" --group "$profile" --group "$PD_GROUP" \
+        --key "$PD_KEY" "$PD_NO_ACTION"
+    done
+    pd_reload
+
+    pd_lid_ok \
+      || die "PowerDevil's lid action still reads '$(pd_lid_label)' — setting did not apply."
+  else
+    info "!! kwriteconfig6 not found — skipped the KDE half."
+    info "   If a Plasma session runs, PowerDevil will still sleep on lid close."
+  fi
+
+  printf '\nOK — closing the lid no longer sleeps the machine, on AC or battery.\n'
+  info "That includes in a bag, where it will stay awake and get warm."
+  info "Revert with: $0 lid suspend"
 }
 
 clear_lid_awake() {
-  if ! lid_awake_enabled; then
+  local pinned=0
+  [[ -e "$LID_DROPIN" ]] && pinned=1
+  # Any profile, not all of them: a partial set is still ours to clean up, and
+  # treating it as "nothing to do" would strand the leftovers.
+  if pd_available && pd_lid_any_set; then pinned=1; fi
+
+  if (( ! pinned )); then
     info "Lid handling is already stock — nothing to do."
     return
   fi
 
-  info "Removing ${LID_DROPIN} (needs sudo) ..."
-  sudo rm -f "$LID_DROPIN"
-  sudo systemctl reload systemd-logind
+  if [[ -e "$LID_DROPIN" ]]; then
+    info "Removing ${LID_DROPIN} (needs sudo) ..."
+    sudo rm -f "$LID_DROPIN"
+    sudo systemctl reload systemd-logind
+  fi
 
-  printf '\nLid handling restored to the SteamOS default (%s).\n' "$(effective_lid_action)"
+  # Delete the keys rather than writing "sleep" back, so PowerDevil returns to
+  # whatever SteamOS or the user configured instead of to our guess at stock.
+  # Every profile is cleared unconditionally: a partially-applied set is exactly
+  # the state a half-finished revert would leave behind.
+  if pd_available; then
+    local profile
+    info "Clearing PowerDevil's lid action ..."
+    for profile in "${PD_PROFILES[@]}"; do
+      kwriteconfig6 --file "$PD_FILE" --group "$profile" --group "$PD_GROUP" \
+        --key "$PD_KEY" --delete
+    done
+    pd_reload
+  fi
+
+  printf '\nLid handling restored to the SteamOS default.\n'
+  show_lid_status
 }
 
 # ------------------------------------------------------------- Screen picking

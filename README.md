@@ -22,7 +22,7 @@ to apply.
 | **Boot mode** | Every boot lands in the gamescope Steam UI | Set default login to Desktop, optionally *lock* it so Steam and OS updates can't change it back |
 | **GPU** | gamescope picks its own GPU on a hybrid laptop | Pin games to the discrete (or integrated) card — **without** dragging the KDE desktop onto the dGPU and burning battery |
 | **Screen** | Game Mode always opens on the internal panel | Pin Steam to any connected display |
-| **Lid** | Leaving Game Mode with the lid shut suspends the machine | Stay awake on AC power; still suspends on battery |
+| **Lid** | Leaving Game Mode with the lid shut suspends the machine | Never sleep on lid close — both daemons that handle the lid (logind *and* KDE PowerDevil), on AC and battery |
 
 Plus `diag`, which timestamps a baseline and then reports suspends and gamescope
 crashes since — for confirming a fix actually held rather than guessing.
@@ -37,12 +37,15 @@ chmod +x steamctl.sh
 ```
 
 No dependencies beyond what SteamOS already ships (`steamosctl`, `systemctl`,
-`busctl`, `vulkaninfo`). The script refuses to run if `steamosctl` is missing.
+`busctl`, `vulkaninfo`, and `kreadconfig6`/`kwriteconfig6` for the KDE half of
+the lid fix). The script refuses to run if `steamosctl` is missing; if the KDE
+config tools are absent it skips the PowerDevil half and says so.
 
 ## Root
 
 Only `lock`/`unlock` and `lid` need sudo — they install a systemd unit and a
-logind drop-in under `/etc`. Boot mode, GPU and screen need **no root at all**:
+logind drop-in under `/etc`; `lid` also writes `~/.config/powerdevilrc` as your
+own user, which doesn't. Boot mode, GPU and screen need **no root at all**:
 `steamos-manager` is polkit-authorized for the `deck` user, and the GPU/screen
 pins live in `$HOME`.
 
@@ -95,13 +98,33 @@ wildcard fallback, so unplugging the pinned display still lets Game Mode start.
 It lives outside `~/.local/bin` on purpose — typing `gamescope` in a terminal
 still gets the stock binary.
 
-**Lid** — leaving Game Mode with the lid shut suspends the laptop because
-gamescope segfaults on teardown, which tears down the DRM outputs; for a moment
-logind sees no external display, stops treating the machine as docked, and falls
-back to `HandleLidSwitch=suspend`. `HandleLidSwitchDocked=ignore` can't help — it
-depends on the display detection that's breaking. `HandleLidSwitchExternalPower`
-keys off AC power instead, so it holds through the glitch. On battery the lid
-still suspends, which is what you want in a bag.
+**Lid** — leaving Game Mode with the lid shut suspends the laptop. The journal
+shows the suspend is requested *before* gamescope's teardown segfault, and no
+lid-switch event is logged at all: the lid was already shut, and what changes is
+ownership. Game Mode means no Plasma session, so PowerDevil's inhibitor isn't
+there; when the gamescope session's own inhibitors drop on exit, logind
+re-evaluates the closed lid and applies its policy on the spot.
+`HandleLidSwitchDocked=ignore` can't help — it depends on the display detection
+that's breaking.
+
+Two daemons decide the lid depending on which session is up, so both are set.
+**logind** covers Game Mode and the TTY (`HandleLidSwitchExternalPower` for AC,
+`HandleLidSwitch` for battery). **KDE PowerDevil** covers the desktop: it takes a
+*block*-mode inhibitor on `handle-lid-switch`, which stops logind acting on the
+lid at all, so under Plasma the logind half is inert and PowerDevil decides —
+using its own docked check, defeated by the same momentary loss of the display.
+Setting only the logind half looks like it worked (logind cheerfully reports
+`ignore`) while the laptop carries on suspending. `LidAction=0` ("do nothing") is
+written for all three PowerDevil profiles — AC, Battery *and* LowBattery, since
+leaving the last one out means the lid quietly starts sleeping the machine again
+once the battery runs down. `lid status` reports whoever actually owns the lid,
+not whichever setting is easiest to read.
+
+The consequence is deliberate: **a closed lid then never sleeps this machine at
+all, bag included**, where it will stay awake and get warm. PowerDevil's separate
+critical-battery action is untouched and still fires. `lid suspend` reverts both
+halves, deleting the PowerDevil keys rather than writing "sleep" back, so it
+returns to whatever SteamOS configured instead of to a guess at stock.
 
 ## Files it touches
 
@@ -110,6 +133,7 @@ still suspends, which is what you want in a bag.
 | `/etc/systemd/system/force-desktop-boot.service` | `lock` | `unlock` |
 | `/etc/sddm.conf.d/zz-steamos-autologin.conf` | the unit above, each boot | steamos-manager reclaims it |
 | `/etc/systemd/logind.conf.d/10-steamctl-lid.conf` | `lid awake` | `lid suspend` |
+| `~/.config/powerdevilrc` (`LidAction` in AC/Battery/LowBattery) | `lid awake` | `lid suspend` (keys deleted) |
 | `~/.config/systemd/user/gamescope-session.service.d/10-steamctl-gpu.conf` | `gpu` | `gpu reset` |
 | `~/.config/systemd/user/gamescope-session.service.d/20-steamctl-screen.conf` | `screen` | `screen reset` |
 | `~/.local/share/steamctl/bin/gamescope` | `screen` | `screen reset` |
